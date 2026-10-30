@@ -19,7 +19,14 @@ MACD_FAST = 12
 MACD_SLOW = 26
 MACD_SIGNAL = 9
 
-st.set_page_config(page_title="TraderDash", page_icon="📈", layout="wide")
+st.set_page_config(
+    page_title="TraderDash",
+    page_icon="📈",
+    layout="wide",
+    menu_items={
+        "About": "TraderDash viser signaler og overblik for de aktier, der følger med din plan.",
+    },
+)
 
 
 def rsi(close: pd.Series, period: int = RSI_PERIOD) -> pd.Series:

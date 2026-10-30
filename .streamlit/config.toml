@@ -1,0 +1,4 @@
+[client]
+# Hide developer actions such as Rerun, Clear cache, and Deploy.
+# Streamlit Community Cloud still adds its own Fork, GitHub, and profile controls.
+toolbarMode = "minimal"
