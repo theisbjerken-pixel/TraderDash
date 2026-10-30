@@ -7,8 +7,6 @@ does not create that file.
 
 from __future__ import annotations
 
-import contextlib
-import io
 import os
 import sqlite3
 import subprocess
@@ -91,37 +89,6 @@ class AccountStoreTests(unittest.TestCase):
     def test_production_configuration_selects_postgres(self):
         with scoped_env(TRADERDASH_ENV="production", DATABASE_URL="postgresql://example/traderdash"):
             self.assertEqual(account_store.storage_backend(), "postgres")
-
-    def test_diagnostic_log_omits_credentials_and_addresses(self):
-        account_store._config_logged = False
-        account_store._failure_logged = False
-        account_store._production_database = True
-        raw = (
-            'connection failed: connection to server at "10.1.2.3", port 5432 failed: '
-            'FATAL: password authentication failed for user "postgres.projectref" '
-            "host: 'aws-0-eu-west-1.pooler.supabase.com' "
-            "postgresql://traderdash:supersecret@db.example.supabase.co:5432/postgres"
-        )
-        safe = account_store._sanitize_database_error(raw)
-        for hidden in ("supersecret", "10.1.2.3", "projectref", "traderdash:", "postgresql://"):
-            self.assertNotIn(hidden, safe)
-        self.assertNotIn("supabase", safe.lower())
-        self.assertNotIn("pooler", safe.lower())
-        self.assertIn("password authentication failed", safe)
-        buffer = io.StringIO()
-        with contextlib.redirect_stderr(buffer):
-            account_store._log_database_configuration(True)
-            account_store._log_database_failure("connect", "OperationalError", raw)
-        logged = buffer.getvalue()
-        self.assertIn("environment=production", logged)
-        self.assertIn("database_url_present=true", logged)
-        self.assertIn("psycopg_available=", logged)
-        self.assertIn("type=OperationalError", logged)
-        self.assertIn("stage=connect", logged)
-        self.assertNotIn("supersecret", logged)
-        self.assertNotIn("supabase", logged.lower())
-        self.assertNotIn("10.1.2.3", logged)
-        self.assertNotIn("postgresql://", logged)
 
     def test_production_connection_failure_does_not_create_sqlite(self):
         sentinel = self.directory / "must-not-exist.db"

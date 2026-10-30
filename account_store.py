@@ -15,7 +15,6 @@ from __future__ import annotations
 import os
 import re
 import sqlite3
-import sys
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -53,10 +52,6 @@ _USER_COLUMNS = """
     stripe_subscription_id, subscription_current_period_end,
     cancel_at_period_end, created_at, updated_at
 """
-_config_logged = False
-_failure_logged = False
-_production_database = False
-_secrets_error_type: str | None = None
 
 
 class AccountError(Exception):
@@ -375,22 +370,7 @@ def _select_backend(database: Path | None) -> tuple[str, Path | str]:
     environment = _setting("TRADERDASH_ENV", "environment").lower()
     database_url = _setting("DATABASE_URL", "database_url")
     if running_on_streamlit_cloud() or environment == "production":
-        global _production_database
-        _production_database = True
-        _log_database_configuration(database_url_present=bool(database_url))
         if not database_url:
-            if _secrets_error_type:
-                _log_database_failure(
-                    "secrets",
-                    _secrets_error_type,
-                    "secrets could not be read",
-                )
-            else:
-                _log_database_failure(
-                    "missing_url",
-                    "AccountConfigError",
-                    "database_url is not set",
-                )
             raise AccountConfigError(SAFE_DB_MESSAGE)
         return ("postgres", database_url)
     if environment == "local":
@@ -475,13 +455,11 @@ def _ensure_sqlite(connection: sqlite3.Connection) -> None:
 def _open_postgres(url: str):
     scheme = urlsplit(url).scheme
     if scheme not in {"postgres", "postgresql"}:
-        _log_database_failure("scheme", "AccountConfigError", "unsupported scheme")
         raise AccountConfigError(SAFE_DB_MESSAGE)
     try:
         import psycopg
         from psycopg.rows import dict_row
     except ImportError as exc:
-        _log_database_failure("driver", type(exc).__name__, "psycopg is not available")
         raise AccountConfigError(SAFE_DB_MESSAGE) from exc
     host = (urlsplit(url).hostname or "").lower()
     kwargs = {
@@ -494,7 +472,6 @@ def _open_postgres(url: str):
     try:
         connection = psycopg.connect(url, **kwargs)
     except Exception as exc:
-        _log_database_failure("connect", type(exc).__name__, str(exc))
         raise AccountConfigError(SAFE_DB_MESSAGE) from exc
     try:
         connection.execute("SELECT user_id FROM users LIMIT 0")
@@ -502,83 +479,8 @@ def _open_postgres(url: str):
         connection.rollback()
     except Exception as exc:
         connection.close()
-        _log_database_failure("schema", type(exc).__name__, str(exc))
         raise AccountConfigError(SCHEMA_MESSAGE) from exc
     return connection
-
-
-def _log_database_configuration(database_url_present: bool) -> None:
-    """Temporary production diagnostic. It never includes a secret or address."""
-    global _config_logged
-    if _config_logged:
-        return
-    _config_logged = True
-    try:
-        available = _psycopg_available()
-        _emit_diag(
-            "Database configuration:\n"
-            "environment=production\n"
-            f"database_url_present={str(bool(database_url_present)).lower()}\n"
-            f"psycopg_available={str(available).lower()}"
-        )
-    except Exception:
-        return
-
-
-def _log_database_failure(stage: str, error_type: str, reason: str) -> None:
-    """Temporary production diagnostic. The reason is sanitized before printing."""
-    global _failure_logged
-    if not _production_database or _failure_logged:
-        return
-    _failure_logged = True
-    try:
-        safe_stage = stage if stage in {"secrets", "missing_url", "scheme", "driver", "connect", "schema"} else "connect"
-        safe_type = error_type if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,80}", error_type) else "Exception"
-        _emit_diag(
-            "Database connection failed:\n"
-            f"type={safe_type}\n"
-            f"stage={safe_stage}\n"
-            f"reason={_sanitize_database_error(reason)}"
-        )
-    except Exception:
-        return
-
-
-def _emit_diag(text: str) -> None:
-    print(text, file=sys.stderr, flush=True)
-
-
-def _psycopg_available() -> bool:
-    try:
-        import psycopg
-        from psycopg.rows import dict_row
-    except ImportError:
-        return False
-    del psycopg, dict_row
-    return True
-
-
-def _sanitize_database_error(message: str) -> str:
-    text = str(message or "")
-    text = re.sub(r"postgres(?:ql)?://\S+", "[redacted]", text, flags=re.IGNORECASE)
-    text = re.sub(r"https?://\S+", "[redacted]", text, flags=re.IGNORECASE)
-    text = re.sub(r"\S+@\S+", "[redacted]", text)
-    text = re.sub(r"(?i)\b(?:password|passwd|pwd)\s*[=:]\s*\S+", "[redacted]", text)
-    text = re.sub(r"(?i)\b(?:user|username|role)\s*=\s*['\"]?[^\s'\"]+", "user=[redacted]", text)
-    text = re.sub(r'(?i)\bfor user "[^"]*"', 'for user "[redacted]"', text)
-    text = re.sub(r"(?i)\bpostgres\.[A-Za-z0-9]+", "[redacted]", text)
-    text = re.sub(r"(?i)\bhost(?:addr)?\s*[:=]\s*'[^']*'", "host=[redacted]", text)
-    text = re.sub(r'(?i)\b(?:server at|host name|hostname) "[^"]*"', "server at [redacted]", text)
-    text = re.sub(r"\b(?:\d{1,3}\.){3}\d{1,3}\b", "[redacted]", text)
-    text = re.sub(r"\b[0-9a-fA-F]{0,4}(?::[0-9a-fA-F]{0,4}){2,}\b", "[redacted]", text)
-    text = re.sub(r"\b[\w.-]*supabase[\w.-]*", "[redacted]", text, flags=re.IGNORECASE)
-    text = re.sub(r"\b[\w.-]*pooler[\w.-]*", "[redacted]", text, flags=re.IGNORECASE)
-    text = re.sub(r'"([A-Za-z0-9.-]+\.[A-Za-z]{2,})"', '"[redacted]"', text)
-    text = re.sub(r"'([A-Za-z0-9.-]+\.[A-Za-z]{2,})'", "'[redacted]'", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    if len(text) > 300:
-        text = text[:300]
-    return text or "unavailable"
 
 
 def _user_from_row(row) -> User:
@@ -654,12 +556,10 @@ def _setting(env_name: str, secret_name: str) -> str:
 
 
 def _secret(key: str) -> str:
-    global _secrets_error_type
     try:
         import streamlit as st
 
         value = st.secrets.get(key, "")
-    except Exception as exc:
-        _secrets_error_type = type(exc).__name__
+    except Exception:
         return ""
     return str(value).strip() if value else ""
