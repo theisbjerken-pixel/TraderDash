@@ -50,7 +50,7 @@ def highest_id(node: dict) -> int:
 def main() -> None:
     data = json.loads(BOOKMARKS.read_text(encoding="utf-8"))
     bar = data["roots"]["bookmark_bar"]["children"]
-    if any(item.get("url") == URL for item in bar):
+    if any(item.get("url") in {URL, f"{URL}/"} or item.get("name") == NAME for item in bar):
         print("already-present")
         return
 
