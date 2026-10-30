@@ -25,6 +25,12 @@ htmlcov/
 .env
 .env.*
 .streamlit/secrets.toml
+data/
+*.db
+
+# Supabase CLI local state
+supabase/.temp/
+supabase/.branches/
 
 # Editors and OS
 .idea/

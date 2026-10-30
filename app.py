@@ -1,49 +1,23 @@
 """TraderDash: kursgraf og nøgletal til portefølje og daytrading."""
 
 import html
-import json
-from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
-import yfinance as yf
+
+import access
+import account_page
+import accounts
+from market_data import describe_freshness, get_history, get_quote
 
 TRADING_DAYS = 252
 RSI_PERIOD = 14
 MACD_FAST = 12
 MACD_SLOW = 26
 MACD_SIGNAL = 9
-
-DANISH_LISTINGS = {
-    "ALSYDB.CO": "AL Sydbank",
-    "AMBU-B.CO": "Ambu",
-    "CARL-B.CO": "Carlsberg",
-    "COLO-B.CO": "Coloplast",
-    "DANSKE.CO": "Danske Bank",
-    "DEMANT.CO": "Demant",
-    "DSV.CO": "DSV",
-    "FLS.CO": "FLSmidth",
-    "GMAB.CO": "Genmab",
-    "GN.CO": "GN Store Nord",
-    "ISS.CO": "ISS",
-    "JYSK.CO": "Jyske Bank",
-    "MAERSK-A.CO": "Mærsk A",
-    "MAERSK-B.CO": "Mærsk B",
-    "NKT.CO": "NKT",
-    "NDA-DK.CO": "Nordea",
-    "NOVO-B.CO": "Novo Nordisk",
-    "NSIS-B.CO": "Novonesis",
-    "PNDORA.CO": "Pandora",
-    "ROCK-B.CO": "Rockwool",
-    "RBREW.CO": "Royal Unibrew",
-    "TRYG.CO": "Tryg",
-    "VWS.CO": "Vestas",
-    "ZEAL.CO": "Zealand Pharma",
-    "ORSTED.CO": "Ørsted",
-}
 
 st.set_page_config(page_title="TraderDash", page_icon="📈", layout="wide")
 
@@ -257,52 +231,23 @@ def signal_card(title: str, action: str, detail: str, tone: str | None = None) -
     )
 
 
-@st.cache_data(show_spinner=False, ttl=300)
 def load_history(symbol: str, period: str) -> pd.DataFrame:
-    history = yf.Ticker(symbol).history(period=period, auto_adjust=True)
-    if history.empty:
-        return history
-    history = history.rename(columns=str.title)
-    return history[["Open", "High", "Low", "Close", "Volume"]].dropna()
+    return get_history(symbol, period)
 
 
-@st.cache_data(show_spinner=False, ttl=60)
 def load_quote(symbol: str) -> dict:
-    try:
-        ticker = yf.Ticker(symbol)
-        info = ticker.info or {}
-    except Exception:
-        ticker = None
-        info = {}
-    bid = info.get("bid")
-    ask = info.get("ask")
-    try:
-        dividends = ticker.dividends
-    except Exception:
-        dividends = pd.Series(dtype=float)
-    return {
-        "bid": float(bid) if bid else None,
-        "ask": float(ask) if ask else None,
-        "bid_size": float(info.get("bidSize") or 0),
-        "ask_size": float(info.get("askSize") or 0),
-        "trailing_pe": optional_float(info.get("trailingPE")),
-        "forward_pe": optional_float(info.get("forwardPE")),
-        "price_to_sales": optional_float(info.get("priceToSalesTrailing12Months")),
-        "price_to_book": optional_float(info.get("priceToBook")),
-        "dividend_yield": dividend_yield_ratio(info),
-        "dividend_growth_5y": annual_dividend_growth(dividends),
-        "payout_ratio": optional_float(info.get("payoutRatio")),
-    }
+    return get_quote(symbol)
 
 
-def optional_float(value: object) -> float | None:
-    try:
-        number = float(value)
-    except (TypeError, ValueError):
-        return None
-    if number != number:
-        return None
-    return number
+def _fetch_notice(history: pd.DataFrame, quote: dict | None = None) -> str | None:
+    notice = history.attrs.get("market_data_error")
+    if notice:
+        return str(notice)
+    if quote:
+        quote_notice = quote.get("_notice")
+        if quote_notice:
+            return str(quote_notice)
+    return None
 
 
 def format_multiple(value: float | None) -> str:
@@ -315,39 +260,6 @@ def format_percent(value: float | None, signed: bool = False) -> str:
     if value is None:
         return "—"
     return f"{value:+.1%}" if signed else f"{value:.1%}"
-
-
-def dividend_yield_ratio(info: dict) -> float | None:
-    trailing = optional_float(info.get("trailingAnnualDividendYield"))
-    if trailing is not None:
-        return trailing
-    stated = optional_float(info.get("dividendYield"))
-    if stated is None:
-        return None
-    return stated / 100 if stated > 1 else stated
-
-
-def annual_dividend_growth(dividends: pd.Series, years: int = 5) -> float | None:
-    if dividends is None or len(dividends) < 2:
-        return None
-    amounts = dividends.dropna()
-    if amounts.empty:
-        return None
-    counts = amounts.groupby(amounts.index.year).size()
-    totals = amounts.groupby(amounts.index.year).sum().sort_index()
-    if len(counts) > 1 and counts.iloc[-1] < counts.iloc[:-1].median():
-        totals = totals.iloc[:-1]
-    if len(totals) < 2:
-        return None
-    end_year = int(totals.index[-1])
-    start_year = end_year - years
-    if start_year not in totals.index:
-        return None
-    start = float(totals.loc[start_year])
-    end = float(totals.loc[end_year])
-    if start <= 0:
-        return None
-    return (end / start) ** (1 / years) - 1
 
 
 def fundamental_cards(quote: dict) -> list[tuple[str, str, str, str | None]]:
@@ -501,171 +413,6 @@ def manager_assessment(name: str, symbol: str, snapshot: dict) -> str:
     )
 
 
-def parse_codes(raw: str) -> list[str]:
-    codes = []
-    for part in raw.replace(";", ",").replace("\n", ",").split(","):
-        code = part.strip().upper()
-        if not code:
-            continue
-        if "." not in code:
-            code = f"{code}.CO"
-        if code not in codes:
-            codes.append(code)
-    return codes
-
-
-STOCKS_PATH = Path(__file__).with_name("stocks.json")
-
-
-def normalize_code(raw: str) -> str:
-    codes = parse_codes(raw)
-    return codes[0] if codes else ""
-
-
-def load_stock_book() -> dict[str, str]:
-    if "stock_book" not in st.session_state:
-        if STOCKS_PATH.exists():
-            try:
-                loaded = json.loads(STOCKS_PATH.read_text(encoding="utf-8"))
-                st.session_state.stock_book = {str(code): str(name) for code, name in loaded.items()}
-            except (OSError, json.JSONDecodeError, AttributeError):
-                st.session_state.stock_book = dict(DANISH_LISTINGS)
-        else:
-            st.session_state.stock_book = dict(DANISH_LISTINGS)
-            save_stock_book()
-    return st.session_state.stock_book
-
-
-def save_stock_book() -> None:
-    STOCKS_PATH.write_text(
-        json.dumps(st.session_state.stock_book, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-
-
-def add_stock(raw_code: str, raw_name: str) -> str | None:
-    code = normalize_code(raw_code)
-    if not code:
-        return "Skriv en fondskode."
-    book = load_stock_book()
-    if code in book:
-        return "Den fondskode findes allerede."
-    book[code] = raw_name.strip() or code
-    save_stock_book()
-    st.session_state.pending_symbol = code
-    return None
-
-
-def update_stock(old_code: str, raw_code: str, raw_name: str) -> str | None:
-    code = normalize_code(raw_code)
-    if not code:
-        return "Skriv en fondskode."
-    book = load_stock_book()
-    if code != old_code and code in book:
-        return "Den fondskode findes allerede."
-    updated = {}
-    for current, name in book.items():
-        if current == old_code:
-            updated[code] = raw_name.strip() or code
-        else:
-            updated[current] = name
-    st.session_state.stock_book = updated
-    save_stock_book()
-    if st.session_state.get("selected_symbol") == old_code:
-        st.session_state.pending_symbol = code
-    return None
-
-
-def delete_stock(code: str) -> str | None:
-    book = load_stock_book()
-    if code not in book:
-        return "Aktien findes ikke længere."
-    if len(book) <= 1:
-        return "Behold mindst én aktie."
-    del book[code]
-    save_stock_book()
-    if st.session_state.get("selected_symbol") == code:
-        st.session_state.pending_symbol = next(iter(book))
-    return None
-
-
-def sync_edit_fields(scope: str) -> None:
-    book = st.session_state.stock_book
-    code = st.session_state[f"{scope}_edit_pick"]
-    st.session_state[f"{scope}_edit_code"] = code
-    st.session_state[f"{scope}_edit_name"] = book.get(code, code)
-
-
-def render_stock_tools(scope: str) -> None:
-    book = load_stock_book()
-    codes = list(book)
-    pick_key = f"{scope}_edit_pick"
-    if st.session_state.pop(f"{scope}_clear_add", False):
-        st.session_state[f"{scope}_add_code"] = ""
-        st.session_state[f"{scope}_add_name"] = ""
-    if st.session_state.pop(f"{scope}_reset_edit", False):
-        st.session_state.pop(pick_key, None)
-        st.session_state.pop(f"{scope}_edit_code", None)
-        st.session_state.pop(f"{scope}_edit_name", None)
-    saved_code = st.session_state.pop(f"{scope}_saved_code", None)
-    if saved_code in book:
-        st.session_state[pick_key] = saved_code
-        st.session_state[f"{scope}_edit_code"] = saved_code
-        st.session_state[f"{scope}_edit_name"] = book[saved_code]
-    if st.session_state.get(pick_key) not in book:
-        st.session_state[pick_key] = codes[0]
-        st.session_state[f"{scope}_edit_code"] = codes[0]
-        st.session_state[f"{scope}_edit_name"] = book[codes[0]]
-    elif f"{scope}_edit_code" not in st.session_state:
-        chosen = st.session_state[pick_key]
-        st.session_state[f"{scope}_edit_code"] = chosen
-        st.session_state[f"{scope}_edit_name"] = book[chosen]
-
-    message = st.session_state.pop(f"{scope}_msg", None)
-    if message:
-        st.caption(message)
-
-    st.text_input("Ny fondskode", key=f"{scope}_add_code")
-    st.text_input("Nyt navn", key=f"{scope}_add_name")
-    if st.button("Tilføj", key=f"{scope}_add", width="stretch"):
-        error = add_stock(st.session_state.get(f"{scope}_add_code", ""), st.session_state.get(f"{scope}_add_name", ""))
-        if error:
-            st.session_state[f"{scope}_msg"] = error
-        else:
-            st.session_state[f"{scope}_clear_add"] = True
-        st.rerun()
-
-    st.selectbox(
-        "Aktie der skal rettes",
-        options=codes,
-        format_func=lambda code: f"{book[code]} ({code})",
-        key=pick_key,
-        on_change=sync_edit_fields,
-        args=(scope,),
-    )
-    st.text_input("Fondskode", key=f"{scope}_edit_code")
-    st.text_input("Navn", key=f"{scope}_edit_name")
-    save_col, delete_col = st.columns(2, gap="small")
-    if save_col.button("Gem", key=f"{scope}_save", width="stretch"):
-        error = update_stock(
-            st.session_state[pick_key],
-            st.session_state.get(f"{scope}_edit_code", ""),
-            st.session_state.get(f"{scope}_edit_name", ""),
-        )
-        if error:
-            st.session_state[f"{scope}_msg"] = error
-        else:
-            st.session_state[f"{scope}_saved_code"] = normalize_code(st.session_state.get(f"{scope}_edit_code", ""))
-        st.rerun()
-    if delete_col.button("Slet", key=f"{scope}_delete", width="stretch"):
-        error = delete_stock(st.session_state[pick_key])
-        if error:
-            st.session_state[f"{scope}_msg"] = error
-        else:
-            st.session_state[f"{scope}_reset_edit"] = True
-        st.rerun()
-
-
 def paint_watch_row(row: pd.Series) -> list[str]:
     colors = {
         "LONG": "background-color: #dcfce7; color: #14532d",
@@ -788,19 +535,91 @@ def build_chart(history: pd.DataFrame, indicator_rsi: pd.Series, indicator_macd:
     return figure
 
 
+def _clear_user_session(*, logout: bool) -> None:
+    for key in [key for key in st.session_state if str(key).startswith("selected_symbol")]:
+        del st.session_state[key]
+    for key in ("selected_market", "dev_plan", "plan", "watch_ready", "main_view", "checkout_notice"):
+        st.session_state.pop(key, None)
+    if logout:
+        st.session_state.pop("auth_user_id", None)
+
+
+def _logout() -> None:
+    st.session_state["_pending_logout"] = True
+    st.rerun()
+
+
+def render_account_gate() -> None:
+    login_tab, register_tab = st.tabs(["Log ind", "Opret konto"])
+    with login_tab:
+        with st.form("login"):
+            email = st.text_input("E-mail", key="login_email")
+            password = st.text_input("Adgangskode", type="password", key="login_password")
+            submitted = st.form_submit_button("Log ind", type="primary")
+        if submitted:
+            try:
+                user = accounts.authenticate(email, password)
+            except accounts.AccountConfigError as exc:
+                st.error(str(exc))
+            else:
+                if user is None:
+                    st.error("Forkert e-mail eller adgangskode.")
+                else:
+                    _clear_user_session(logout=False)
+                    st.session_state.auth_user_id = user.user_id
+                    st.rerun()
+    with register_tab:
+        with st.form("register"):
+            email = st.text_input("E-mail", key="register_email")
+            password = st.text_input("Adgangskode", type="password", key="register_password")
+            confirmation = st.text_input("Gentag adgangskode", type="password", key="register_confirmation")
+            submitted = st.form_submit_button("Opret konto", type="primary")
+        if submitted:
+            if password != confirmation:
+                st.error("Adgangskoderne er ikke ens.")
+            else:
+                try:
+                    user = accounts.create_user(email, password)
+                except accounts.AccountConfigError as exc:
+                    st.error(str(exc))
+                except accounts.AccountError as exc:
+                    st.error(str(exc))
+                else:
+                    _clear_user_session(logout=False)
+                    st.session_state.auth_user_id = user.user_id
+                    st.rerun()
+
+
 st.title("TraderDash")
 st.caption("Enkelt aktie med signaler, eller et farvet overblik over en hel liste.")
 
-stock_book = load_stock_book()
-if st.session_state.get("pending_symbol") in stock_book:
-    st.session_state.selected_symbol = st.session_state.pop("pending_symbol")
-elif "selected_symbol" not in st.session_state or st.session_state.selected_symbol not in stock_book:
-    st.session_state.selected_symbol = "NOVO-B.CO" if "NOVO-B.CO" in stock_book else next(iter(stock_book))
-else:
-    st.session_state.pop("pending_symbol", None)
+for obsolete_key in [key for key in st.session_state if key == "stock_book" or key == "pending_symbol" or str(key).startswith("liste_")]:
+    del st.session_state[obsolete_key]
+for query_key in ("ticker", "symbol", "stock", "code", "user", "user_id", "plan"):
+    if query_key in st.query_params:
+        del st.query_params[query_key]
+
+if st.session_state.pop("_pending_logout", False):
+    _clear_user_session(logout=True)
+
+try:
+    signed_in = accounts.get_user(str(st.session_state.get("auth_user_id") or ""))
+except accounts.AccountConfigError as exc:
+    st.error(str(exc))
+    st.stop()
+if signed_in is None:
+    _clear_user_session(logout=True)
+    render_account_gate()
+    st.stop()
 
 with st.sidebar:
     st.header("Opslag")
+    st.radio(
+        "Side",
+        options=("analysis", "account"),
+        format_func=lambda value: "Analyse" if value == "analysis" else "Konto",
+        key="main_view",
+    )
     period = st.selectbox(
         "Periode",
         options=["1mo", "3mo", "6mo", "1y", "2y", "5y"],
@@ -810,44 +629,103 @@ with st.sidebar:
     risk_free_pct = st.slider("Risikofri rente (%)", min_value=0.0, max_value=8.0, value=2.0, step=0.5)
     risk_free_rate = risk_free_pct / 100
     st.caption("Perioden og renten bruges både på enkeltaktien og i watchlisten.")
-    st.divider()
-    st.header("Portefølje")
-    render_stock_tools("liste")
+    if accounts.developer_override_enabled():
+        if st.session_state.get("dev_plan") not in access.PLANS:
+            st.session_state.dev_plan = accounts.resolve_plan(signed_in.plan)
+        st.selectbox(
+            "Plan",
+            options=list(access.PLANS),
+            format_func=lambda key: access.PLAN_LABELS[key],
+            key="dev_plan",
+        )
+        st.caption("Udviklertest. Kontoens plan ændres ikke.")
+        plan = accounts.resolve_plan(signed_in.plan, st.session_state.get("dev_plan"))
+    else:
+        plan = accounts.resolve_plan(signed_in.plan, st.session_state.get("plan"))
+        st.caption(f"Plan: {access.PLAN_LABELS.get(plan, 'Free')}")
+    st.session_state.plan = plan
+    st.caption(signed_in.email)
+    if st.button("Log ud", width="stretch"):
+        _logout()
+
+if st.session_state.get("main_view") == "account":
+    account_page.render_account(signed_in, plan, _logout)
+    st.stop()
 
 single_tab, watch_tab = st.tabs(["Enkelt Aktie", "Watchlist Overblik"])
 
 with single_tab:
-    symbol = st.selectbox(
-        "Aktie",
-        options=list(stock_book),
-        format_func=lambda code: f"{stock_book[code]} ({code})",
-        key="selected_symbol",
-    )
+    plan = st.session_state.plan
+
+    def market_label(country: str) -> str:
+        label = access.MARKET_LABELS[country]
+        if access.can_access_market(country, plan):
+            return label
+        return f"{label} 🔒"
+
+    if st.session_state.get("selected_market") not in access.MARKETS:
+        st.session_state.selected_market = "denmark"
+    st.selectbox("Marked", options=list(access.MARKETS), format_func=market_label, key="selected_market")
+    market = st.session_state.selected_market
+    market_stocks = access.stocks_in_market(market)
+    market_codes = list(market_stocks)
+    stock_key = f"selected_symbol__{market}"
+    if market_codes and st.session_state.get(stock_key) not in market_codes:
+        _market, default_symbol = access.aligned_selection(market, None, plan)
+        st.session_state[stock_key] = default_symbol
+
+    def stock_label(code: str) -> str:
+        name = market_stocks[code]
+        shown = f"{name} ({code})"
+        if access.may_analyse(code, plan, market):
+            return shown
+        return f"{shown} 🔒"
+
+    symbol = st.selectbox("Aktie", options=market_codes, format_func=stock_label, key=stock_key)
+    if symbol not in market_codes or access.market_of(symbol) != market:
+        _market, symbol = access.aligned_selection(market, None, plan)
     history = pd.DataFrame()
     quote = {}
     fetch_failed = False
+    allowed = access.may_analyse(symbol, plan, st.session_state.selected_market)
     if not symbol:
         st.info("Vælg en aktie.")
+    elif not allowed:
+        required = access.minimum_plan_for_ticker(symbol) or access.minimum_plan_for_market(st.session_state.selected_market)
+        if required:
+            st.info(f"🔒 {access.upgrade_message(required)}")
+        else:
+            st.info("Den aktie er ikke en del af TraderDash.")
     else:
         with st.spinner(f"Henter {symbol}..."):
             try:
                 history = load_history(symbol, period)
-                quote = load_quote(symbol)
+                quote = {} if history.empty or len(history) < MACD_SLOW + MACD_SIGNAL else load_quote(symbol)
             except Exception:
                 fetch_failed = True
-                st.error(f"Kunne ikke hente kursdata for {symbol}. Tjek forbindelsen, og prøv igen.")
+                st.error("Kursdata er midlertidigt utilgængelige. Prøv igen om et øjeblik.")
                 history = pd.DataFrame()
+                quote = {}
 
-    if symbol and not fetch_failed and (history.empty or len(history) < MACD_SLOW + MACD_SIGNAL):
-        st.error(f"Fandt ikke nok kursdata for {symbol}. Tjek fondskoden, eller vælg en længere periode.")
-    elif symbol and not fetch_failed:
+    if allowed and symbol and not fetch_failed and (history.empty or len(history) < MACD_SLOW + MACD_SIGNAL):
+        st.error(
+            _fetch_notice(history, quote)
+            or f"Fandt ikke nok kursdata for {symbol}. Tjek fondskoden, eller vælg en længere periode."
+        )
+    elif allowed and symbol and not fetch_failed:
+        quote_notice = quote.get("_notice")
+        if quote_notice:
+            st.warning(str(quote_notice))
+        updated = describe_freshness(history)
+        if updated:
+            st.caption(updated)
         snapshot = signal_snapshot(history, quote, risk_free_rate)
         render_split_cards(snapshot["cards"], fundamental_cards(quote))
         st.plotly_chart(
             build_chart(history, snapshot["rsi"], snapshot["macd"], symbol),
             width="stretch",
         )
-        assessment = manager_assessment(load_stock_book().get(symbol, symbol), symbol, snapshot)
+        assessment = manager_assessment(market_stocks.get(symbol, symbol), symbol, snapshot)
         if snapshot["stance"] == "LONG":
             st.success(assessment)
         elif snapshot["stance"] == "SHORT":
@@ -862,24 +740,34 @@ with watch_tab:
         st.session_state.watch_ready = True
 
     if st.session_state.get("watch_ready"):
-        codes = list(load_stock_book())[:40]
+        entitled = access.get_allowed_stocks(st.session_state.plan)
+        codes = [code for code in entitled if access.may_analyse(code, st.session_state.plan)]
         if not codes:
-            st.info("Skriv mindst én fondskode.")
+            st.info("Ingen aktier på denne plan.")
         else:
             rows = []
+            notices: list[str] = []
             progress = st.progress(0, text="Henter watchlist...")
             for index, code in enumerate(codes, start=1):
+                if not access.may_analyse(code, st.session_state.plan):
+                    continue
                 progress.progress(index / len(codes), text=f"Henter {code} ({index}/{len(codes)})")
                 try:
                     item_history = load_history(code, period)
-                    item_quote = load_quote(code)
+                    history_ready = not item_history.empty and len(item_history) >= MACD_SLOW + MACD_SIGNAL
+                    item_quote = load_quote(code) if history_ready else {}
                 except Exception:
                     item_history = pd.DataFrame()
                     item_quote = {}
-                if item_history.empty or len(item_history) < MACD_SLOW + MACD_SIGNAL:
+                    history_ready = False
+                    notices.append("Kursdata er midlertidigt utilgængelige. Prøv igen om et øjeblik.")
+                notice = _fetch_notice(item_history, item_quote)
+                if notice:
+                    notices.append(notice)
+                if not history_ready:
                     rows.append(
                         {
-                            "Aktie": load_stock_book().get(code, code),
+                            "Aktie": entitled.get(code, code),
                             "Kode": code,
                             "Kurs": "—",
                             "Ændring": "—",
@@ -896,7 +784,7 @@ with watch_tab:
                 item = signal_snapshot(item_history, item_quote, risk_free_rate)
                 rows.append(
                     {
-                        "Aktie": load_stock_book().get(code, code),
+                        "Aktie": entitled.get(code, code),
                         "Kode": code,
                         "Kurs": f"{item['price']:,.2f}",
                         "Ændring": f"{item['change']:+.1%}",
@@ -910,5 +798,7 @@ with watch_tab:
                     }
                 )
             progress.empty()
+            if notices:
+                st.warning(list(dict.fromkeys(notices))[0])
             overview = pd.DataFrame(rows).sort_values("_net", ascending=False).drop(columns="_net")
             st.dataframe(overview.style.apply(paint_watch_row, axis=1), width="stretch", hide_index=True)

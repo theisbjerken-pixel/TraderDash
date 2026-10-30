@@ -1,0 +1,9 @@
+# Local Supabase CLI config. Link the cloud project with `supabase link`.
+# The project ref and database password stay on this machine, not in git.
+
+project_id = "traderdash"
+
+# Stripe calls this function with no Supabase user token.
+# The function checks the Stripe signature instead.
+[functions.stripe-webhook]
+verify_jwt = false
