@@ -16,8 +16,6 @@ RSI_PERIOD = 14
 MACD_FAST = 12
 MACD_SLOW = 26
 MACD_SIGNAL = 9
-INDEX_SYMBOL = "^OMXC25"
-INDEX_LABEL = "OMXC25"
 
 DANISH_LISTINGS = {
     "ALSYDB.CO": "AL Sydbank",
@@ -266,190 +264,6 @@ def load_history(symbol: str, period: str) -> pd.DataFrame:
         return history
     history = history.rename(columns=str.title)
     return history[["Open", "High", "Low", "Close", "Volume"]].dropna()
-
-
-def load_close_panel(
-    codes: list[str],
-    labels: dict[str, str],
-    period: str,
-    progress_text: str = "Henter kurser...",
-) -> tuple[pd.DataFrame, list[str]]:
-    closes: dict[str, pd.Series] = {}
-    missing: list[str] = []
-    progress = st.progress(0, text=progress_text)
-    total = max(len(codes), 1)
-    for index, code in enumerate(codes, start=1):
-        label = labels.get(code, code)
-        progress.progress(index / total, text=f"Henter {label} ({index}/{total})")
-        try:
-            history = load_history(code, period)
-        except Exception:
-            history = pd.DataFrame()
-        if history.empty or "Close" not in history:
-            missing.append(label)
-            continue
-        series = history["Close"].copy()
-        series.index = pd.to_datetime(series.index).tz_localize(None)
-        closes[label] = series
-    progress.empty()
-    if not closes:
-        return pd.DataFrame(), missing
-    return pd.DataFrame(closes).sort_index(), missing
-
-
-def correlation_matrix(codes: list[str], labels: dict[str, str], period: str) -> tuple[pd.DataFrame, list[str]]:
-    prices, missing = load_close_panel(codes, labels, period, "Henter kurser til korrelation...")
-    if prices.shape[1] < 2:
-        return pd.DataFrame(), missing
-    returns = prices.pct_change().dropna(how="all")
-    usable = returns.dropna(axis=1, thresh=max(10, len(returns) // 5))
-    if usable.shape[1] < 2:
-        return pd.DataFrame(), missing
-    return usable.corr(), missing
-
-
-def period_return(series: pd.Series) -> float | None:
-    clean = series.dropna()
-    if len(clean) < 2 or clean.iloc[0] == 0:
-        return None
-    return float(clean.iloc[-1] / clean.iloc[0] - 1)
-
-
-def portfolio_track(
-    book: dict[str, str],
-    period: str,
-) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, float | None], list[str]] | tuple[None, None, None, list[str]]:
-    codes = list(book)
-    labels = {code: book[code] for code in codes}
-    labels[INDEX_SYMBOL] = INDEX_LABEL
-    prices, missing = load_close_panel(
-        codes + [INDEX_SYMBOL],
-        labels,
-        period,
-        "Henter kurser til portefølje-track...",
-    )
-    stock_cols = [book[code] for code in codes if book[code] in prices.columns]
-    if INDEX_LABEL not in prices.columns or not stock_cols:
-        return None, None, None, missing
-
-    stock_prices = prices[stock_cols]
-    index_prices = prices[INDEX_LABEL]
-    stock_returns = stock_prices.pct_change()
-    portfolio_returns = stock_returns.mean(axis=1, skipna=True)
-    index_returns = index_prices.pct_change()
-    daily = pd.DataFrame({"Portefølje": portfolio_returns, INDEX_LABEL: index_returns}).dropna()
-    if daily.empty:
-        return None, None, None, missing
-
-    cumulative = (1 + daily).cumprod()
-    normalized = cumulative / cumulative.iloc[0] * 100
-
-    port_total = float(normalized["Portefølje"].iloc[-1] / 100 - 1)
-    index_total = float(normalized[INDEX_LABEL].iloc[-1] / 100 - 1)
-    index_var = float(daily[INDEX_LABEL].var())
-    beta = float(daily["Portefølje"].cov(daily[INDEX_LABEL]) / index_var) if index_var > 0 else None
-    tracking_error = float(daily["Portefølje"].sub(daily[INDEX_LABEL]).std() * np.sqrt(TRADING_DAYS))
-    summary = {
-        "portfolio": port_total,
-        "index": index_total,
-        "excess": port_total - index_total,
-        "beta": beta,
-        "tracking_error": tracking_error,
-        "volatility": float(daily["Portefølje"].std() * np.sqrt(TRADING_DAYS)),
-        "index_volatility": float(daily[INDEX_LABEL].std() * np.sqrt(TRADING_DAYS)),
-        "count": float(len(stock_cols)),
-    }
-
-    rows = []
-    for code in codes:
-        name = book[code]
-        if name not in stock_prices.columns:
-            continue
-        stock_total = period_return(stock_prices[name])
-        if stock_total is None:
-            continue
-        rows.append(
-            {
-                "Aktie": name,
-                "Kode": code,
-                "Afkast": stock_total,
-                "Vs indeks": stock_total - index_total,
-            }
-        )
-    holdings = pd.DataFrame(rows).sort_values("Vs indeks", ascending=False)
-    return normalized, holdings, summary, missing
-
-
-def build_track_chart(normalized: pd.DataFrame) -> go.Figure:
-    figure = go.Figure()
-    figure.add_trace(
-        go.Scatter(
-            x=normalized.index,
-            y=normalized["Portefølje"],
-            name="Portefølje (ligevægtet)",
-            line={"color": "#0f766e", "width": 2.4},
-        )
-    )
-    figure.add_trace(
-        go.Scatter(
-            x=normalized.index,
-            y=normalized[INDEX_LABEL],
-            name=f"{INDEX_LABEL} (Nasdaq Copenhagen)",
-            line={"color": "#64748b", "width": 2, "dash": "dot"},
-        )
-    )
-    figure.update_layout(
-        title="Portefølje vs OMX Copenhagen 25",
-        yaxis_title="Indekseret (start = 100)",
-        height=460,
-        margin={"l": 20, "r": 20, "t": 56, "b": 20},
-        legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "x": 0},
-        hovermode="x unified",
-    )
-    figure.add_hline(y=100, line_dash="dot", line_color="#94a3b8", opacity=0.7)
-    return figure
-
-
-def paint_track_row(row: pd.Series) -> list[str]:
-    excess = row.get("Vs indeks", 0)
-    if isinstance(excess, str):
-        return [""] * len(row)
-    if excess > 0:
-        color = "background-color:#dcfce7;color:#14532d"
-    elif excess < 0:
-        color = "background-color:#fee2e2;color:#7f1d1d"
-    else:
-        color = "background-color:#fef9c3;color:#713f12"
-    return [color] * len(row)
-
-
-def build_correlation_heatmap(corr: pd.DataFrame) -> go.Figure:
-    labels = list(corr.columns)
-    values = corr.to_numpy()
-    text = [[f"{value:.2f}" for value in row] for row in values]
-    figure = go.Figure(
-        data=go.Heatmap(
-            z=values,
-            x=labels,
-            y=labels,
-            zmin=-1,
-            zmax=1,
-            colorscale="RdBu_r",
-            text=text,
-            texttemplate="%{text}",
-            textfont={"size": 11},
-            hovertemplate="%{y} ↔ %{x}<br>Korrelation: %{z:.2f}<extra></extra>",
-            colorbar={"title": "ρ", "thickness": 14},
-        )
-    )
-    figure.update_layout(
-        title="Korrelationsmatrice (daglige afkast)",
-        height=max(520, 36 * len(labels) + 160),
-        margin={"l": 20, "r": 20, "t": 56, "b": 20},
-        xaxis={"side": "bottom", "tickangle": -45},
-        yaxis={"autorange": "reversed"},
-    )
-    return figure
 
 
 @st.cache_data(show_spinner=False, ttl=60)
@@ -995,14 +809,12 @@ with st.sidebar:
     )
     risk_free_pct = st.slider("Risikofri rente (%)", min_value=0.0, max_value=8.0, value=2.0, step=0.5)
     risk_free_rate = risk_free_pct / 100
-    st.caption("Perioden bruges på enkeltaktie, watchlist, korrelation og track. Renten bruges på signalerne.")
+    st.caption("Perioden og renten bruges både på enkeltaktien og i watchlisten.")
     st.divider()
     st.header("Portefølje")
     render_stock_tools("liste")
 
-single_tab, watch_tab, corr_tab, track_tab = st.tabs(
-    ["Enkelt Aktie", "Watchlist Overblik", "Korrelation", "Portefølje Track"]
-)
+single_tab, watch_tab = st.tabs(["Enkelt Aktie", "Watchlist Overblik"])
 
 with single_tab:
     symbol = st.selectbox(
@@ -1100,72 +912,3 @@ with watch_tab:
             progress.empty()
             overview = pd.DataFrame(rows).sort_values("_net", ascending=False).drop(columns="_net")
             st.dataframe(overview.style.apply(paint_watch_row, axis=1), width="stretch", hide_index=True)
-
-with corr_tab:
-    st.caption(
-        "Korrelation mellem daglige afkast for aktierne i porteføljen og "
-        "OMX Copenhagen 25 (Nasdaq Copenhagen). Perioden styres i venstre side."
-    )
-    show_correlation = st.button("Opdater korrelation", type="primary")
-    if show_correlation:
-        st.session_state.corr_ready = True
-
-    if st.session_state.get("corr_ready"):
-        book = load_stock_book()
-        codes = list(book)
-        labels = {code: book[code] for code in codes}
-        labels[INDEX_SYMBOL] = INDEX_LABEL
-        matrix_codes = codes + [INDEX_SYMBOL]
-        if not codes:
-            st.info("Tilføj mindst én aktie i porteføljen for at se korrelation.")
-        else:
-            corr, missing = correlation_matrix(matrix_codes, labels, period)
-            if corr.empty:
-                st.error("Fandt ikke nok overlappende kursdata til en korrelationsmatrice.")
-            else:
-                st.plotly_chart(build_correlation_heatmap(corr), width="stretch")
-                st.dataframe(corr.style.format("{:.2f}"), width="stretch")
-                if missing:
-                    st.warning("Mangler data for: " + ", ".join(missing))
-
-with track_tab:
-    st.caption(
-        "Track af den eksisterende portefølje (ligevægtet) mod OMX Copenhagen 25. "
-        "Vælg perioden i dropdown-menuen til venstre."
-    )
-    show_track = st.button("Opdater track", type="primary")
-    if show_track:
-        st.session_state.track_ready = True
-
-    if st.session_state.get("track_ready"):
-        book = load_stock_book()
-        if not book:
-            st.info("Tilføj mindst én aktie i porteføljen for at tracke performance.")
-        else:
-            normalized, holdings, summary, missing = portfolio_track(book, period)
-            if normalized is None or holdings is None or summary is None:
-                st.error("Fandt ikke nok kursdata til at tracke porteføljen mod indekset.")
-            else:
-                metric_cols = st.columns(4)
-                metric_cols[0].metric("Portefølje", f"{summary['portfolio']:+.1%}")
-                metric_cols[1].metric("OMXC25", f"{summary['index']:+.1%}")
-                metric_cols[2].metric("Merafkast", f"{summary['excess']:+.1%}")
-                metric_cols[3].metric(
-                    "Beta",
-                    "—" if summary["beta"] is None else f"{summary['beta']:.2f}",
-                )
-                extra_cols = st.columns(3)
-                extra_cols[0].metric("Volatilitet", f"{summary['volatility']:.1%}")
-                extra_cols[1].metric("Indeks-volatilitet", f"{summary['index_volatility']:.1%}")
-                extra_cols[2].metric("Tracking error", f"{summary['tracking_error']:.1%}")
-                st.caption(
-                    f"Ligevægtet portefølje med {int(summary['count'])} aktier. "
-                    "Afkast er totalafkast i den valgte periode."
-                )
-                st.plotly_chart(build_track_chart(normalized), width="stretch")
-                styled = holdings.style.format(
-                    {"Afkast": "{:+.1%}", "Vs indeks": "{:+.1%}"}
-                ).apply(paint_track_row, axis=1)
-                st.dataframe(styled, width="stretch", hide_index=True)
-                if missing:
-                    st.warning("Mangler data for: " + ", ".join(missing))
